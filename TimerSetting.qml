@@ -13,6 +13,7 @@ Column {
   property real minimum: 0
   property real maximum: 100
   property real step: 1
+  property real settingWidth: -1
 
   signal settingChanged(real value)
 
@@ -22,8 +23,8 @@ Column {
       root.minimum + Math.round((value - root.minimum) / safeStep) * safeStep))
   }
 
-  width: parent ? parent.width : Style.space(300)
-  spacing: Style.space(1)
+  width: root.settingWidth >= 0 ? root.settingWidth : (parent ? parent.width : Style.space(300))
+  spacing: 0
 
   Row {
     width: parent.width
@@ -36,6 +37,7 @@ Column {
       font.family: root.bar ? root.bar.fontFamily : Style.font.family
       font.pixelSize: Style.font.caption
       font.bold: true
+      elide: Text.ElideRight
       anchors.verticalCenter: parent.verticalCenter
     }
 
@@ -55,7 +57,8 @@ Column {
   PanelSlider {
     bar: root.bar
     width: parent.width
-    height: implicitHeight
+    height: Style.space(18)
+    knobSize: Style.space(12)
     minimum: root.minimum
     maximum: root.maximum
     step: root.step

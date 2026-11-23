@@ -8,12 +8,28 @@ import re
 import sys
 import tempfile
 from pathlib import Path
+import tomllib
 
 
 HOME = Path.home()
 CONFIG = HOME / ".config/omarchy/shell.toml"
+SHELL_JSON = HOME / ".config/omarchy/shell.json"
 STATE = HOME / ".local/state/omarchy/plugins/dim-it/bar-foreground.json"
+THEME = HOME / ".local/state/omarchy/current/theme/shell.toml"
 KEYS = ("text", "active")
+
+
+def theme_colors() -> dict[str, str]:
+    """Read the real foreground palette, not the temporary user override."""
+    try:
+        with THEME.open("rb") as stream:
+            bar = tomllib.load(stream).get("bar", {})
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise ValueError(f"cannot read active Omarchy bar theme: {THEME}") from error
+    colors = {key: canonical_color(bar.get(key)) for key in KEYS}
+    if any(value is None for value in colors.values()):
+        raise ValueError(f"active Omarchy theme has invalid bar foreground colors: {THEME}")
+    return colors
 
 
 def read_lines(path: Path) -> list[str]:
@@ -103,6 +119,20 @@ def darken(color: str, factor: float) -> str:
     return "#" + alpha + "".join(f"{channel:02x}" for channel in channels)
 
 
+def canonical_color(color: str | None) -> str | None:
+    if not isinstance(color, str):
+        return None
+    value = color.strip().lower()
+    if not re.fullmatch(r"#[0-9a-f]{6}(?:[0-9a-f]{2})?", value):
+        return None
+    return value if len(value) == 9 else "#ff" + value[1:]
+
+
+def line_color(line: str, key: str) -> str | None:
+    match = re.match(rf'^\s*{re.escape(key)}\s*=\s*"(#[0-9a-fA-F]+)"', line)
+    return canonical_color(match.group(1)) if match else None
+
+
 def load_state() -> dict | None:
     try:
         return json.loads(STATE.read_text())
@@ -119,65 +149,128 @@ def save_state(state: dict) -> None:
     os.replace(temporary, STATE)
 
 
+def read_bar_background() -> tuple[bool, object]:
+    try:
+        parsed = json.loads(SHELL_JSON.read_text())
+    except json.JSONDecodeError as error:
+        raise ValueError(f"invalid Omarchy shell config: {SHELL_JSON}") from error
+    bar = parsed.get("bar") if isinstance(parsed, dict) else None
+    if not isinstance(parsed, dict):
+        raise ValueError(f"Omarchy shell config must contain an object: {SHELL_JSON}")
+    if not isinstance(bar, dict):
+        return False, None
+    return "background" in bar, bar.get("background")
+
+
+def write_bar_background(value: object | None, present: bool = True) -> None:
+    parsed = json.loads(SHELL_JSON.read_text())
+    if not isinstance(parsed, dict):
+        raise ValueError("shell.json must contain an object")
+    bar = parsed.get("bar")
+    if not isinstance(bar, dict):
+        bar = {}
+        parsed["bar"] = bar
+    if present:
+        bar["background"] = value
+    else:
+        bar.pop("background", None)
+
+    mode = SHELL_JSON.stat().st_mode & 0o777
+    fd, temporary = tempfile.mkstemp(dir=SHELL_JSON.parent, prefix=".dim-it-shell.")
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump(parsed, stream, indent=2)
+            stream.write("\n")
+        os.chmod(temporary, mode)
+        os.replace(temporary, SHELL_JSON)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
 def apply(mode: str, text_color: str, active_color: str) -> None:
     if mode not in ("dark", "very-dark", "black"):
         raise ValueError(f"unknown foreground mode: {mode}")
+    # The user shell.toml may contain this plugin's last temporary values.
+    # Always use the active theme as the base so repeated dim cycles cannot
+    # progressively darken the bar or preserve a stale black foreground.
+    palette = theme_colors()
     state = load_state()
+    new_state = state is None
     if state is None:
         lines = read_lines(CONFIG)
         start, end = section_bounds(lines, "bar")
         original = {}
         for key in KEYS:
             index = key_index(lines, start, end, key)
-            original[key] = lines[index] if index is not None else None
+            original[key] = f'{key} = "{palette[key]}"\n'
         state = {
             "hadFile": CONFIG.exists(),
             "hadBarSection": start is not None,
             "original": original,
-            "base": {"text": text_color, "active": active_color},
+            "base": palette,
         }
+        had_background, original_background = read_bar_background()
+        state["hadBarBackground"] = had_background
+        state["originalBarBackground"] = original_background
         save_state(state)
+    elif "originalBarBackground" not in state:
+        had_background, original_background = read_bar_background()
+        state["hadBarBackground"] = had_background
+        state["originalBarBackground"] = original_background
+
+    if not new_state and "appliedBarBackground" in state:
+        had_background, current_background = read_bar_background()
+        if not had_background or current_background != state["appliedBarBackground"]:
+            state["hadBarBackground"] = had_background
+            state["originalBarBackground"] = current_background
+
+    incoming_base = palette
+    if not new_state and isinstance(state.get("applied"), dict):
+        lines = read_lines(CONFIG)
+        start, end = section_bounds(lines, "bar")
+        theme_changed = False
+        for key in KEYS:
+            incoming = incoming_base[key]
+            previous = canonical_color(state["applied"].get(key))
+            if incoming and incoming != previous:
+                state["base"][key] = incoming
+                theme_changed = True
+                state["original"][key] = f'{key} = "{incoming}"\n'
+        if theme_changed:
+            state["hadFile"] = CONFIG.exists()
+            state["hadBarSection"] = start is not None
 
     if mode == "black":
         changed = {key: "#ff000000" for key in KEYS}
     else:
         factor = 1.5 if mode == "dark" else 2.1
         changed = {key: darken(state["base"][key], factor) for key in KEYS}
+
+    state["applied"] = changed
+    state["appliedBarBackground"] = "none"
+    save_state(state)
     replace_keys(changed)
+    write_bar_background("none")
 
 
 def restore() -> None:
     state = load_state()
+    palette = theme_colors()
+    # Always restore the current Omarchy theme. The saved foreground snapshot
+    # may be stale, or another writer may have changed the temporary colors.
+    replace_keys(palette)
     if state is None:
         return
-    lines = read_lines(CONFIG)
-    start, end = section_bounds(lines, "bar")
-    if start is not None and end is not None:
-        for key in reversed(KEYS):
-            index = key_index(lines, start, end, key)
-            original_line = state["original"].get(key)
-            if original_line is None:
-                if index is not None:
-                    lines.pop(index)
-                    end -= 1
-            elif index is not None:
-                lines[index] = original_line
-            else:
-                lines.insert(end, original_line)
-                end += 1
-
-        if not state.get("hadBarSection"):
-            content = [line for line in lines[start + 1:end] if line.strip() and not line.lstrip().startswith("#")]
-            if not content:
-                del lines[start:end]
-    if not state.get("hadFile") and not any(line.strip() for line in lines):
-        try:
-            CONFIG.unlink()
-        except FileNotFoundError:
-            pass
-    else:
-        CONFIG.parent.mkdir(parents=True, exist_ok=True)
-        CONFIG.write_text("".join(lines))
+    if "originalBarBackground" in state:
+        if "appliedBarBackground" not in state:
+            write_bar_background(state.get("originalBarBackground"), state.get("hadBarBackground", False))
+        else:
+            had_background, current_background = read_bar_background()
+            if had_background and current_background == state["appliedBarBackground"]:
+                write_bar_background(state.get("originalBarBackground"), state.get("hadBarBackground", False))
     try:
         STATE.unlink()
     except FileNotFoundError:

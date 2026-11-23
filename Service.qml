@@ -2,6 +2,7 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 import Quickshell.Services.Mpris
+import Quickshell.Hyprland
 import Quickshell.Wayland
 
 Item {
@@ -14,15 +15,19 @@ Item {
 
   property int displayDimSeconds: 60
   property int barDimSeconds: 60
+  property int screensaverSeconds: 150
   property int monitorOffSeconds: 0
-  property bool nativeIdle: false
-  property double nativeIdleSinceMs: 0
-  property int nativeIdleElapsedSeconds: 0
+  property int lockSeconds: 300
+  property bool actionIdle: false
+  property double actionIdleSinceMs: 0
+  property int actionIdleElapsedSeconds: 0
   property bool barPlaybackIdle: false
   property double barPlaybackIdleSinceMs: 0
   property int barPlaybackElapsedSeconds: 0
-  property bool nativeLockLatched: false
-  property bool lockTriggered: false
+  property bool screensaverStartedThisCycle: false
+  property bool screensaverLaunchPending: false
+  property var screensaverWindows: ({})
+  property int screensaverWindowCount: 0
   property int dimPercentage: 25
   property bool enabled: true
   property bool barColorDuringPlayback: false
@@ -31,8 +36,19 @@ Item {
   property bool isDimmed: false
   property bool manualTest: false
   property bool monitorWasTurnedOff: false
+  property bool lockStartedThisCycle: false
+  property bool omarchyIdleEnabled: false
+  property bool omarchyIdleStatusLoaded: false
 
-  readonly property bool monitorShouldBeActive: enabled && !stayAwake
+  readonly property bool monitorShouldBeActive: enabled && !stayAwake && omarchyIdleStatusLoaded
+  readonly property int firstActionTimeoutSeconds: {
+    var delays = [displayDimSeconds, barDimSeconds, monitorOffSeconds]
+    if (!omarchyIdleEnabled) delays.push(screensaverSeconds, lockSeconds)
+    var first = Infinity
+    for (var i = 0; i < delays.length; i++)
+      if (delays[i] > 0 && delays[i] < first) first = delays[i]
+    return isFinite(first) ? first : 0
+  }
   readonly property var mediaPlayers: Mpris.players ? Mpris.players.values : []
   readonly property bool playbackActive: {
     var players = root.mediaPlayers
@@ -47,6 +63,7 @@ Item {
     var parsed = null
     try { parsed = JSON.parse(String(raw || "")) } catch (e) { parsed = null }
     if (!parsed || typeof parsed !== "object") return
+    var previousDimPercentage = dimPercentage
     displayDimSeconds = typeof parsed.displayDimSeconds === "number" && parsed.displayDimSeconds >= 5 && parsed.displayDimSeconds <= 18000
       ? Math.round(parsed.displayDimSeconds)
       : typeof parsed.dimSeconds === "number" && parsed.dimSeconds >= 5 && parsed.dimSeconds <= 3600
@@ -55,13 +72,33 @@ Item {
       ? Math.round(parsed.barDimSeconds)
       : typeof parsed.dimSeconds === "number" && parsed.dimSeconds >= 5 && parsed.dimSeconds <= 3600
         ? Math.round(parsed.dimSeconds) : 60
-    monitorOffSeconds = typeof parsed.monitorOffSeconds === "number" && parsed.monitorOffSeconds >= 0 && parsed.monitorOffSeconds <= 18000
-      ? Math.round(parsed.monitorOffSeconds) : 0
+    screensaverSeconds = typeof parsed.screensaverSeconds === "number" && parsed.screensaverSeconds >= 0
+      ? Math.round(parsed.screensaverSeconds) : screensaverSeconds
+    screensaverSeconds = Math.min(1800, screensaverSeconds)
+    monitorOffSeconds = typeof parsed.monitorOffSeconds === "number" && parsed.monitorOffSeconds >= 0
+      ? Math.min(3600, Math.round(parsed.monitorOffSeconds)) : 0
+    lockSeconds = typeof parsed.lockSeconds === "number" && parsed.lockSeconds >= 0
+      ? Math.min(10800, Math.round(parsed.lockSeconds)) : lockSeconds
     if (typeof parsed.dimPercentage === "number" && parsed.dimPercentage >= 1 && parsed.dimPercentage <= 100)
       dimPercentage = Math.round(parsed.dimPercentage)
     if (typeof parsed.enabled === "boolean") enabled = parsed.enabled
     if (typeof parsed.barColorDuringPlayback === "boolean") barColorDuringPlayback = parsed.barColorDuringPlayback
     else if (typeof parsed.playbackTimerEnabled === "boolean") barColorDuringPlayback = parsed.playbackTimerEnabled
+
+    if (root.actionIdle) {
+      if (root.isDimmed && !root.manualTest && root.actionIdleElapsedSeconds < root.displayDimSeconds) {
+        root.handleActive()
+      } else if (root.isDimmed && root.savedBrightness > 0 && dimPercentage !== previousDimPercentage) {
+        var target = Math.max(1, Math.round(root.savedBrightness * root.dimPercentage / 100))
+        Quickshell.execDetached(["omarchy-brightness-display", "--no-osd", target + "%"])
+      }
+      if (root.monitorWasTurnedOff
+          && (root.monitorOffSeconds <= 0 || root.actionIdleElapsedSeconds < root.monitorOffSeconds)) {
+        root.monitorWasTurnedOff = false
+        Quickshell.execDetached(["hyprctl", "dispatch", 'hl.dsp.dpms({ action = "enable" })'])
+      }
+      root.applyIdleActions()
+    }
   }
 
   property FileView configFile: FileView {
@@ -80,6 +117,42 @@ Item {
     onFileChanged: reload()
     onLoaded: root.stayAwake = true
     onLoadFailed: root.stayAwake = false
+  }
+
+  function applyPluginStatus(raw) {
+    var plugins = null
+    try { plugins = JSON.parse(String(raw)) } catch (e) { plugins = null }
+    if (!Array.isArray(plugins)) {
+      omarchyIdleStatusLoaded = false
+      return
+    }
+    for (var i = 0; i < plugins.length; i++) {
+      if (plugins[i] && plugins[i].id === "omarchy.idle") {
+        omarchyIdleEnabled = plugins[i].enabled === true
+        omarchyIdleStatusLoaded = true
+        return
+      }
+    }
+    omarchyIdleStatusLoaded = false
+  }
+
+  Process {
+    id: pluginStatusProcess
+    command: ["omarchy-shell", "shell", "listPlugins"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.applyPluginStatus(String(text || ""))
+    }
+    onExited: function(exitCode) {
+      if (exitCode !== 0) root.omarchyIdleStatusLoaded = false
+    }
+  }
+
+  Timer {
+    interval: 2000
+    running: true
+    repeat: true
+    onTriggered: if (!pluginStatusProcess.running) pluginStatusProcess.running = true
   }
 
   Timer {
@@ -104,93 +177,126 @@ Item {
     Quickshell.execDetached(["omarchy-brightness-display", "--no-osd", restoreValue + "%"])
   }
 
-  function endNativeIdle() {
-    var hadNativeState = root.nativeIdle || root.nativeLockLatched
-    root.nativeIdle = false
-    root.nativeIdleSinceMs = 0
-    root.nativeIdleElapsedSeconds = 0
-    root.nativeLockLatched = false
-    root.lockTriggered = false
-    if (hadNativeState) root.handleActive()
+  function resetScreensaverWindows() {
+    root.screensaverWindows = ({})
+    root.screensaverWindowCount = 0
+  }
+
+  function beginActionIdle() {
+    if (root.actionIdle || root.firstActionTimeoutSeconds <= 0) return
+    root.actionIdle = true
+    root.actionIdleSinceMs = Date.now() - root.firstActionTimeoutSeconds * 1000
+    root.actionIdleElapsedSeconds = root.firstActionTimeoutSeconds
+    root.screensaverStartedThisCycle = false
+    root.screensaverLaunchPending = false
+    root.monitorWasTurnedOff = false
+    root.lockStartedThisCycle = false
+    root.resetScreensaverWindows()
+    root.applyIdleActions()
+  }
+
+  function endActionIdle(reason) {
+    var hadActionState = root.actionIdle || root.screensaverStartedThisCycle || root.screensaverLaunchPending
+    root.actionIdle = false
+    root.actionIdleSinceMs = 0
+    root.actionIdleElapsedSeconds = 0
+    root.screensaverStartedThisCycle = false
+    root.screensaverLaunchPending = false
+    root.lockStartedThisCycle = false
+    screensaverLaunchTimer.stop()
+    screensaverLaunchGraceTimer.stop()
+    root.resetScreensaverWindows()
+    if (hadActionState) root.handleActive()
     if (root.monitorWasTurnedOff) {
       root.monitorWasTurnedOff = false
-      Quickshell.execDetached(["hyprctl", "dispatch", "dpms", "on"])
+      Quickshell.execDetached(["hyprctl", "dispatch", 'hl.dsp.dpms({ action = "enable" })'])
+    }
+  }
+
+  function handleActionMonitorActive() {
+    if (!root.actionIdle) return
+    if (root.screensaverStartedThisCycle
+        && (root.screensaverWindowCount > 0 || screensaverLaunchGraceTimer.running)) return
+    root.endActionIdle("activity")
+  }
+
+  function setScreensaverWindow(address, visible) {
+    var key = String(address || "")
+    if (!key) return
+    var next = ({})
+    var count = 0
+    for (var existing in root.screensaverWindows) {
+      if (existing !== key && root.screensaverWindows[existing]) {
+        next[existing] = true
+        count++
+      }
+    }
+    if (visible) {
+      next[key] = true
+      count++
+    }
+    root.screensaverWindows = next
+    root.screensaverWindowCount = count
+  }
+
+  function handleHyprlandEvent(event) {
+    var name = String(event && event.name ? event.name : "")
+    var parts = []
+    try { parts = event && event.parse ? event.parse(name === "openwindow" ? 4 : 1) : [] } catch (e) {}
+    if (name === "openwindow" && String(parts[2] || "") === "org.omarchy.screensaver") {
+      root.setScreensaverWindow(String(parts[0] || ""), true)
+      root.screensaverStartedThisCycle = true
+      root.screensaverLaunchPending = false
+      screensaverLaunchTimer.stop()
+      screensaverLaunchGraceTimer.stop()
+    } else if (name === "closewindow") {
+      var address = String(parts[0] || "")
+      if (root.screensaverWindows[address]) {
+        root.setScreensaverWindow(address, false)
+        if (root.actionIdle && root.screensaverStartedThisCycle && root.screensaverWindowCount === 0)
+          root.endActionIdle("screensaver-dismissed")
+      }
     }
   }
 
   function restoreIdleEffects() {
-    root.endNativeIdle()
+    root.endActionIdle("disabled")
+    root.barPlaybackMonitorWasIdle = false
+    root.barPlaybackIdle = false
+    root.barPlaybackIdleSinceMs = 0
+    root.barPlaybackElapsedSeconds = 0
     root.handleActive()
     if (root.monitorWasTurnedOff) {
       root.monitorWasTurnedOff = false
-      Quickshell.execDetached(["hyprctl", "dispatch", "dpms", "on"])
+      Quickshell.execDetached(["hyprctl", "dispatch", 'hl.dsp.dpms({ action = "enable" })'])
     }
-  }
-
-  function applyNativeIdleStatus(raw) {
-    if (!raw || String(raw).length > 8192) {
-      root.endNativeIdle()
-      return
-    }
-    var status = null
-    try { status = JSON.parse(String(raw)) } catch (e) { status = null }
-    if (!status || typeof status !== "object") {
-      root.endNativeIdle()
-      return
-    }
-
-    var screensaver = Number(status.screensaver)
-    var nativeLock = Number(status.lock)
-    var firstTimeout = Math.min(
-      screensaver > 0 && isFinite(screensaver) ? screensaver : Infinity,
-      nativeLock > 0 && isFinite(nativeLock) ? nativeLock : Infinity
-    )
-    var nativeEnabled = root.monitorShouldBeActive && status.enabled === true && isFinite(firstTimeout)
-    var inNativeCycle = status.idle === true || status.inIdleCycle === true
-    var event = String(status.lastEvent || "")
-    var activeEvent = event.indexOf("idle-monitor: active") === 0 && status.inIdleCycle !== true
-
-    if (event.indexOf("lock-system") === 0 || event.indexOf("process-start: lock") === 0) {
-      root.nativeLockLatched = true
-      root.lockTriggered = true
-    }
-    if (activeEvent) root.nativeLockLatched = false
-
-    if (!nativeEnabled || (!inNativeCycle && !root.nativeLockLatched)) {
-      root.endNativeIdle()
-      return
-    }
-
-    if (!root.nativeIdle) {
-      var eventAt = Date.parse(String(status.lastEventAt || ""))
-      var eventTimeout = firstTimeout
-      var canAnchorToNativeEvent = event.indexOf("idle-cycle-start") === 0 || event.indexOf("idle-monitor: idle") === 0
-      if (event.indexOf("lock-system") === 0 || event.indexOf("process-start: lock") === 0) {
-        eventTimeout = nativeLock
-        canAnchorToNativeEvent = nativeLock > 0
-      } else if (event.indexOf("screensaver") !== -1 && screensaver > 0) {
-        eventTimeout = screensaver
-        canAnchorToNativeEvent = true
-      }
-      root.nativeIdleSinceMs = canAnchorToNativeEvent && isFinite(eventAt)
-        ? eventAt - eventTimeout * 1000
-        : Date.now() - firstTimeout * 1000
-      root.nativeIdle = true
-      root.lockTriggered = root.nativeLockLatched || (status.processes && status.processes.lock === true)
-      root.monitorWasTurnedOff = false
-    }
-
-    root.nativeIdleElapsedSeconds = Math.max(0, Math.floor((Date.now() - root.nativeIdleSinceMs) / 1000))
-    root.applyIdleActions()
   }
 
   function applyIdleActions() {
-    if (!root.nativeIdle || !root.monitorShouldBeActive) return
-    if (!root.isDimmed && root.displayDimSeconds > 0 && root.nativeIdleElapsedSeconds >= root.displayDimSeconds)
+    if (!root.actionIdle || !root.monitorShouldBeActive) return
+    if (!root.isDimmed && root.displayDimSeconds > 0 && root.actionIdleElapsedSeconds >= root.displayDimSeconds)
       root.handleDimIdle(false)
-    if (!root.monitorWasTurnedOff && root.monitorOffSeconds > 0 && root.nativeIdleElapsedSeconds >= root.monitorOffSeconds) {
+    if (!root.omarchyIdleEnabled && root.screensaverSeconds > 0
+        && root.actionIdleElapsedSeconds >= root.screensaverSeconds
+        && !root.screensaverStartedThisCycle && !root.screensaverLaunchPending) {
+      root.screensaverLaunchPending = true
+      screensaverLaunchGraceTimer.restart()
+      screensaverLaunchTimer.restart()
+    }
+    if (!root.omarchyIdleEnabled && root.lockSeconds > 0
+        && root.actionIdleElapsedSeconds >= root.lockSeconds
+        && !root.lockStartedThisCycle) {
+      root.lockStartedThisCycle = true
+      root.screensaverStartedThisCycle = false
+      root.screensaverLaunchPending = false
+      screensaverLaunchTimer.stop()
+      screensaverLaunchGraceTimer.stop()
+      lockStatusProcess.command = ["omarchy-shell", "lock", "isLocked"]
+      lockStatusProcess.running = true
+    }
+    if (!root.monitorWasTurnedOff && root.monitorOffSeconds > 0 && root.actionIdleElapsedSeconds >= root.monitorOffSeconds) {
       root.monitorWasTurnedOff = true
-      Quickshell.execDetached(["hyprctl", "dispatch", "dpms", "off"])
+      Quickshell.execDetached(["hyprctl", "dispatch", 'hl.dsp.dpms({ action = "disable" })'])
     }
   }
 
@@ -220,6 +326,24 @@ Item {
     }
   }
 
+  onOmarchyIdleEnabledChanged: {
+    if (omarchyIdleEnabled) {
+      screensaverLaunchTimer.stop()
+      screensaverLaunchGraceTimer.stop()
+      screensaverLaunchPending = false
+    }
+    if (actionIdle) applyIdleActions()
+  }
+
+  IdleMonitor {
+    id: actionIdleMonitor
+    enabled: root.monitorShouldBeActive && root.firstActionTimeoutSeconds > 0
+    timeout: Math.max(1, root.firstActionTimeoutSeconds)
+    respectInhibitors: true
+    onIsIdleChanged: if (isIdle) root.beginActionIdle(); else root.handleActionMonitorActive()
+    Component.onCompleted: if (isIdle) root.beginActionIdle()
+  }
+
   IdleMonitor {
     id: playbackIdleMonitor
     enabled: root.barPlaybackOverrideActive && root.barDimSeconds > 0
@@ -231,28 +355,46 @@ Item {
 
   Timer {
     interval: 1000
-    running: root.barPlaybackOverrideActive && root.barPlaybackMonitorWasIdle
+    running: root.actionIdle || (root.barPlaybackOverrideActive && root.barPlaybackMonitorWasIdle)
     repeat: true
-    onTriggered: root.updatePlaybackIdle(playbackIdleMonitor.isIdle)
-  }
-
-  Process {
-    id: nativeIdleStatusProcess
-    command: ["omarchy-shell", "idle", "status"]
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root.applyNativeIdleStatus(String(text || ""))
-    }
-    onExited: function(exitCode) {
-      if (exitCode !== 0) root.endNativeIdle()
+    onTriggered: {
+      if (root.actionIdle) {
+        root.actionIdleElapsedSeconds = Math.max(0,
+          Math.floor((Date.now() - root.actionIdleSinceMs) / 1000))
+        root.applyIdleActions()
+      }
+      if (root.barPlaybackOverrideActive)
+        root.updatePlaybackIdle(playbackIdleMonitor.isIdle)
     }
   }
 
   Timer {
-    interval: 1000
-    running: true
-    repeat: true
-    onTriggered: if (!nativeIdleStatusProcess.running) nativeIdleStatusProcess.running = true
+    id: screensaverLaunchTimer
+    interval: 1200
+    repeat: false
+    onTriggered: {
+      if (!root.actionIdle || !root.screensaverLaunchPending) return
+      root.screensaverStartedThisCycle = true
+      root.screensaverLaunchPending = false
+      Quickshell.execDetached(["omarchy-launch-screensaver"])
+    }
+  }
+
+  Timer {
+    id: screensaverLaunchGraceTimer
+    interval: 3000
+    repeat: false
+    onTriggered: {
+      if (!root.screensaverWindowCount && !actionIdleMonitor.isIdle)
+        root.endActionIdle("screensaver-not-running")
+      else if (!root.screensaverWindowCount)
+        root.screensaverStartedThisCycle = false
+    }
+  }
+
+  Connections {
+    target: Hyprland
+    function onRawEvent(event) { root.handleHyprlandEvent(event) }
   }
 
   Process {
@@ -278,7 +420,28 @@ Item {
     }
   }
 
-  readonly property bool isIdle: root.nativeIdle
+  Process {
+    id: lockStatusProcess
+    command: []
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        if (String(text || "").trim() === "true") return
+        lockProcess.command = ["omarchy-system-lock"]
+        lockProcess.running = true
+      }
+    }
+  }
+
+  Process {
+    id: lockProcess
+    command: []
+    onExited: function(exitCode, exitStatus) {
+      if (exitCode !== 0) console.warn("Dim-It: native lock command failed with exit code " + exitCode)
+    }
+  }
+
+  readonly property bool isIdle: root.actionIdle
 
   onMonitorShouldBeActiveChanged: {
     if (!monitorShouldBeActive) root.restoreIdleEffects()
@@ -286,17 +449,27 @@ Item {
 
   IpcHandler {
     target: "dim-it.service"
+    function reloadSettings(): void { root.configFile.reload() }
     function status(): string {
       return JSON.stringify({ enabled: root.enabled, stayAwake: root.stayAwake,
+        omarchyIdleEnabled: root.omarchyIdleEnabled,
+        omarchyIdleStatusLoaded: root.omarchyIdleStatusLoaded,
+        monitorShouldBeActive: root.monitorShouldBeActive,
+        monitorWasTurnedOff: root.monitorWasTurnedOff,
         displayDimSeconds: root.displayDimSeconds, barDimSeconds: root.barDimSeconds,
         monitorOffSeconds: root.monitorOffSeconds, barColorDuringPlayback: root.barColorDuringPlayback,
+        screensaverSeconds: root.screensaverSeconds,
+        lockSeconds: root.lockSeconds,
+        lockStartedThisCycle: root.lockStartedThisCycle,
         playbackActive: root.playbackActive,
         dimPercentage: root.dimPercentage,
         isDimmed: root.isDimmed, isIdle: root.isIdle,
-        barTimerIdle: root.nativeIdle || root.barPlaybackIdle,
-        barIdleElapsedSeconds: Math.max(root.nativeIdle ? root.nativeIdleElapsedSeconds : 0, root.barPlaybackIdle ? root.barPlaybackElapsedSeconds : 0),
-        nativeIdleElapsedSeconds: root.nativeIdleElapsedSeconds,
-        nativeLockLatched: root.nativeLockLatched })
+        barTimerIdle: root.barPlaybackIdle || (root.actionIdle && root.actionIdleElapsedSeconds >= root.barDimSeconds),
+        barIdleElapsedSeconds: Math.max(
+          root.barPlaybackIdle ? root.barPlaybackElapsedSeconds : 0,
+          root.actionIdle ? root.actionIdleElapsedSeconds : 0
+        ),
+        idleElapsedSeconds: root.actionIdleElapsedSeconds })
     }
     function triggerDim(): void { root.handleDimIdle(true) }
     function triggerActive(): void { root.handleActive() }

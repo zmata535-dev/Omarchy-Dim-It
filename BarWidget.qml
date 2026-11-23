@@ -20,9 +20,16 @@ BarWidget {
   property int monitorOffSeconds: 0
   property int screensaverSeconds: 150
   property int lockSeconds: 300
+  property int dimItScreensaverSeconds: 150
+  property int dimItLockSeconds: 300
+  property bool dimItLockSettingLoaded: false
+  property int nativeScreensaverSeconds: 150
+  property int nativeLockSeconds: 300
+  property bool nativeIdleConfigLoaded: false
   property int dimPercentage: 25
   property bool barColorDuringPlayback: false
-  property string foregroundMode: "dark"
+  property bool blinkClockEnabled: true
+  property string foregroundMode: "very-dark"
   property bool enabled: true
   property bool stayAwake: false
   property bool popupOpen: false
@@ -32,28 +39,46 @@ BarWidget {
   property bool nativeConfigDirty: false
   property bool saveError: false
   property bool foregroundSyncPending: false
-  property bool nativeIdle: false
-  property int nativeIdleElapsedSeconds: 0
-  property bool nativeStatusLoaded: false
+  property bool idleCycleActive: false
+  property int idleElapsedSeconds: 0
+  property bool idleStatusLoaded: false
+  property bool omarchyIdleEnabled: false
+  property bool omarchyIdleStatusLoaded: false
+  property bool omarchyIdleTogglePending: false
+  property string omarchyIdleToggleError: ""
   readonly property bool opened: popupOpen
-  readonly property bool isIdle: nativeIdle && nativeIdleElapsedSeconds >= barDimSeconds
+  readonly property bool isIdle: idleCycleActive && idleElapsedSeconds >= barDimSeconds
   readonly property bool indicatorDimmed: root.isIdle || root.testDimActive
   readonly property color themeForeground: root.bar ? root.bar.barForeground : Commons.Color.bar.text
+  readonly property color themeActiveColor: root.bar ? root.bar.urgent : Commons.Color.urgent
   readonly property string foregroundScript: Quickshell.env("HOME") + "/.config/omarchy/plugins/dim-it/bar-foreground.py"
 
   function open() { popupOpen = true }
   function close() { popupOpen = false }
   function toggle() { popupOpen = !popupOpen }
-  function applyIdleServiceStatus(raw) {
+  function applyDimItServiceStatus(raw) {
     if (!raw || String(raw).length > 8192) return
     var status = null
     try { status = JSON.parse(String(raw)) } catch (e) { status = null }
     if (!status || typeof status !== "object") return
-    nativeIdle = status.barTimerIdle === true || status.isIdle === true
-    var elapsed = status.barTimerIdle === true ? status.barIdleElapsedSeconds : status.nativeIdleElapsedSeconds
-    nativeIdleElapsedSeconds = nativeIdle && typeof elapsed === "number"
+    idleCycleActive = status.isIdle === true || status.barTimerIdle === true
+    var elapsed = status.isIdle === true && typeof status.idleElapsedSeconds === "number"
+      ? status.idleElapsedSeconds : status.barIdleElapsedSeconds
+    idleElapsedSeconds = idleCycleActive && typeof elapsed === "number"
       ? Math.max(0, Math.min(18000, Math.floor(elapsed))) : 0
-    nativeStatusLoaded = true
+    if (typeof status.omarchyIdleEnabled === "boolean") {
+      omarchyIdleEnabled = status.omarchyIdleEnabled
+      omarchyIdleStatusLoaded = status.omarchyIdleStatusLoaded === true
+      syncIdleTimerValues()
+    }
+    idleStatusLoaded = true
+  }
+  function setOmarchyIdlePluginEnabled(value) {
+    if (!omarchyIdleStatusLoaded || omarchyIdleTogglePending) return
+    omarchyIdleTogglePending = true
+    omarchyIdleToggleError = ""
+    idlePluginToggleProcess.command = ["omarchy-shell", "shell", "setPluginEnabled", "omarchy.idle", value ? "true" : "false"]
+    idlePluginToggleProcess.running = true
   }
   function testDim() {
     testDimActive = true
@@ -71,7 +96,7 @@ BarWidget {
     }
     if (root.indicatorDimmed && root.bar) {
       foregroundSync.command = ["python3", root.foregroundScript, "apply", root.foregroundMode,
-        String(root.bar.barForeground), String(root.bar.urgent)]
+        String(root.themeForeground), String(root.themeActiveColor)]
     } else {
       foregroundSync.command = ["python3", root.foregroundScript, "restore"]
     }
@@ -79,17 +104,19 @@ BarWidget {
   }
   onIndicatorDimmedChanged: syncBarForeground()
   onForegroundModeChanged: if (indicatorDimmed) syncBarForeground()
+  onThemeForegroundChanged: if (indicatorDimmed) syncBarForeground()
+  onThemeActiveColorChanged: if (indicatorDimmed) syncBarForeground()
   onEnabledChanged: {
     if (!enabled) {
-      nativeIdle = false
-      nativeIdleElapsedSeconds = 0
+      idleCycleActive = false
+      idleElapsedSeconds = 0
       testDimActive = false
       popupOpen = false
       Quickshell.execDetached(["omarchy-shell", "dim-it.service", "triggerActive"])
       syncBarForeground()
     }
   }
-  function secondsUntilDim(timeoutSeconds) { return Math.max(0, timeoutSeconds - nativeIdleElapsedSeconds) }
+  function secondsUntilDim(timeoutSeconds) { return Math.max(0, timeoutSeconds - idleElapsedSeconds) }
   function formatSeconds(seconds) {
     if (seconds < 60) return strings.t("time.seconds").arg(seconds)
     var minutes = Math.floor(seconds / 60)
@@ -98,6 +125,18 @@ BarWidget {
   }
   function formatTimeout(seconds) {
     return seconds <= 0 ? strings.t("time.off") : formatSeconds(seconds)
+  }
+  function clampTimeout(seconds, maximum) {
+    return Math.max(0, Math.min(maximum, Math.round(Number(seconds) || 0)))
+  }
+  function syncIdleTimerValues() {
+    if (omarchyIdleStatusLoaded && omarchyIdleEnabled && nativeIdleConfigLoaded) {
+      screensaverSeconds = nativeScreensaverSeconds
+      lockSeconds = nativeLockSeconds
+    } else {
+      screensaverSeconds = dimItScreensaverSeconds
+      lockSeconds = dimItLockSeconds
+    }
   }
   function applyConfig(raw) {
     if (settingsDirty) return
@@ -110,25 +149,34 @@ BarWidget {
       ? Math.round(parsed.displayDimSeconds) : legacySeconds
     barDimSeconds = typeof parsed.barDimSeconds === "number" && parsed.barDimSeconds >= 5 && parsed.barDimSeconds <= 18000
       ? Math.round(parsed.barDimSeconds) : legacySeconds
-    monitorOffSeconds = typeof parsed.monitorOffSeconds === "number" && parsed.monitorOffSeconds >= 0 && parsed.monitorOffSeconds <= 18000
-      ? Math.round(parsed.monitorOffSeconds) : 0
+    monitorOffSeconds = typeof parsed.monitorOffSeconds === "number" && parsed.monitorOffSeconds >= 0
+      ? clampTimeout(parsed.monitorOffSeconds, 3600) : 0
     if (typeof parsed.dimPercentage === "number" && parsed.dimPercentage >= 1 && parsed.dimPercentage <= 100) dimPercentage = Math.round(parsed.dimPercentage)
     if (typeof parsed.barColorDuringPlayback === "boolean") barColorDuringPlayback = parsed.barColorDuringPlayback
     else if (typeof parsed.playbackTimerEnabled === "boolean") barColorDuringPlayback = parsed.playbackTimerEnabled
-    foregroundMode = parsed.foregroundMode === "dark" || parsed.foregroundMode === "very-dark" || parsed.foregroundMode === "black"
-      ? parsed.foregroundMode : "dark"
+    if (typeof parsed.screensaverSeconds === "number" && parsed.screensaverSeconds >= 0) {
+      dimItScreensaverSeconds = clampTimeout(parsed.screensaverSeconds, 1800)
+    }
+    dimItLockSettingLoaded = typeof parsed.lockSeconds === "number" && parsed.lockSeconds >= 0
+    if (dimItLockSettingLoaded) dimItLockSeconds = clampTimeout(parsed.lockSeconds, 10800)
+    if (typeof parsed.blinkClockEnabled === "boolean") blinkClockEnabled = parsed.blinkClockEnabled
+    foregroundMode = parsed.foregroundMode === "black" ? "black" : "very-dark"
     if (typeof parsed.enabled === "boolean") enabled = parsed.enabled
     settingsDirty = false
+    syncIdleTimerValues()
   }
   function applyNativeConfig(raw) {
-    if (settingsDirty || nativeConfigDirty || !String(raw || "").trim()) return
+    if (nativeConfigDirty || !String(raw || "").trim()) return
     try {
       var parsed = JSON.parse(String(raw || ""))
       var idle = parsed && parsed.idle && typeof parsed.idle === "object" ? parsed.idle : ({})
-      screensaverSeconds = typeof idle.screensaver === "number" && idle.screensaver >= 0 && idle.screensaver <= 18000
-        ? Math.round(idle.screensaver) : 150
-      lockSeconds = typeof idle.lock === "number" && idle.lock >= 0 && idle.lock <= 18000
-        ? Math.round(idle.lock) : 300
+      nativeScreensaverSeconds = typeof idle.screensaver === "number" && idle.screensaver >= 0
+        ? clampTimeout(idle.screensaver, 1800) : 150
+      nativeLockSeconds = typeof idle.lock === "number" && idle.lock >= 0
+        ? clampTimeout(idle.lock, 10800) : 300
+      nativeIdleConfigLoaded = true
+      if (!dimItLockSettingLoaded) dimItLockSeconds = nativeLockSeconds
+      syncIdleTimerValues()
       saveError = false
     } catch (e) {
       saveError = true
@@ -136,9 +184,10 @@ BarWidget {
   }
   function saveConfig() {
     var data = { displayDimSeconds: displayDimSeconds, barDimSeconds: barDimSeconds,
-      monitorOffSeconds: monitorOffSeconds,
+      screensaverSeconds: dimItScreensaverSeconds, lockSeconds: dimItLockSeconds, monitorOffSeconds: monitorOffSeconds,
       dimPercentage: dimPercentage, foregroundMode: foregroundMode,
-      barColorDuringPlayback: barColorDuringPlayback, enabled: enabled }
+      barColorDuringPlayback: barColorDuringPlayback, blinkClockEnabled: blinkClockEnabled,
+      enabled: enabled }
     var output = JSON.stringify(data, null, 2) + "\n"
     if (configFile && typeof configFile.setText === "function") configFile.setText(output)
     settingsDirty = false
@@ -150,8 +199,8 @@ BarWidget {
       var parsed = JSON.parse(source)
       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Invalid shell config")
       if (!parsed.idle || typeof parsed.idle !== "object" || Array.isArray(parsed.idle)) parsed.idle = ({})
-      parsed.idle.screensaver = screensaverSeconds
-      parsed.idle.lock = lockSeconds
+      parsed.idle.screensaver = nativeScreensaverSeconds
+      parsed.idle.lock = nativeLockSeconds
       nativeConfigDirty = true
       shellConfigFile.setText(JSON.stringify(parsed, null, 2) + "\n")
       saveError = false
@@ -161,9 +210,27 @@ BarWidget {
   }
   function selectDisplayTimeout(seconds) { displayDimSeconds = seconds; settingsDirty = true }
   function selectBarTimeout(seconds) { barDimSeconds = seconds; settingsDirty = true }
-  function selectMonitorOffTimeout(seconds) { monitorOffSeconds = seconds; settingsDirty = true }
-  function selectScreensaverTimeout(seconds) { screensaverSeconds = seconds; settingsDirty = true; nativeConfigDirty = true }
-  function selectLockTimeout(seconds) { lockSeconds = seconds; settingsDirty = true; nativeConfigDirty = true }
+  function selectMonitorOffTimeout(seconds) { monitorOffSeconds = clampTimeout(seconds, 3600); settingsDirty = true }
+  function selectScreensaverTimeout(seconds) {
+    screensaverSeconds = clampTimeout(seconds, 1800)
+    if (omarchyIdleStatusLoaded && omarchyIdleEnabled) {
+      nativeScreensaverSeconds = screensaverSeconds
+      nativeConfigDirty = true
+    } else {
+      dimItScreensaverSeconds = screensaverSeconds
+      settingsDirty = true
+    }
+  }
+  function selectLockTimeout(seconds) {
+    lockSeconds = clampTimeout(seconds, 10800)
+    if (omarchyIdleStatusLoaded && omarchyIdleEnabled) {
+      nativeLockSeconds = lockSeconds
+      nativeConfigDirty = true
+    } else {
+      dimItLockSeconds = lockSeconds
+      settingsDirty = true
+    }
+  }
   function selectLevel(percent) { dimPercentage = percent; settingsDirty = true }
   function saveSettings() { saveConfig(); if (nativeConfigDirty) saveNativeConfig() }
   function restartShell() { Quickshell.execDetached(["omarchy", "restart", "shell"]) }
@@ -173,7 +240,10 @@ BarWidget {
     watchChanges: true
     printErrors: false
     onFileChanged: reload()
-    onSaved: root.settingsDirty = false
+    onSaved: {
+      root.settingsDirty = false
+      Quickshell.execDetached(["omarchy-shell", "dim-it.service", "reloadSettings"])
+    }
     onLoaded: {
       root.applyConfig(text())
       if (!root.settingsLoaded) {
@@ -200,6 +270,7 @@ BarWidget {
     onSaved: {
       root.nativeConfigDirty = false
       root.saveError = false
+      Quickshell.execDetached(["omarchy-shell", "shell", "reloadConfig"])
     }
   }
   Process {
@@ -228,17 +299,17 @@ BarWidget {
     onTriggered: { root.configFile.reload(); stayAwakeFile.reload() }
   }
   Process {
-    id: idleServiceStatusProcess
+    id: dimItServiceStatusProcess
     command: ["omarchy-shell", "dim-it.service", "status"]
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root.applyIdleServiceStatus(String(text || ""))
+      onStreamFinished: root.applyDimItServiceStatus(String(text || ""))
     }
     onExited: function(exitCode) {
       if (exitCode !== 0) {
-        root.nativeIdle = false
-        root.nativeIdleElapsedSeconds = 0
-        root.nativeStatusLoaded = false
+        root.idleCycleActive = false
+        root.idleElapsedSeconds = 0
+        root.idleStatusLoaded = false
       }
     }
   }
@@ -246,12 +317,12 @@ BarWidget {
     interval: 1000
     running: true
     repeat: true
-    onTriggered: if (!idleServiceStatusProcess.running) idleServiceStatusProcess.running = true
+    onTriggered: if (!dimItServiceStatusProcess.running) dimItServiceStatusProcess.running = true
   }
   onStayAwakeChanged: {
     if (stayAwake) {
-      nativeIdle = false
-      nativeIdleElapsedSeconds = 0
+      idleCycleActive = false
+      idleElapsedSeconds = 0
     }
   }
 
@@ -266,15 +337,38 @@ BarWidget {
     slotSize: Style.bar.iconSlot
     active: root.indicatorDimmed
     useActiveColor: false
-    foreground: root.themeForeground
-    tooltipText: !root.enabled ? strings.t("tooltip.disabled")
+    foreground: root.enabled ? root.themeForeground : Commons.Color.muted
+    tooltipText: root.omarchyIdleEnabled ? strings.t("tooltip.omarchy_idle")
+      : !root.omarchyIdleStatusLoaded ? strings.t("tooltip.checking_idle")
+      : !root.enabled ? strings.t("tooltip.disabled")
       : root.stayAwake ? strings.t("tooltip.stay_awake")
       : root.testDimActive ? strings.t("tooltip.test_dim")
       : root.isIdle ? strings.t("tooltip.idle")
       : strings.t("tooltip.after").arg(root.formatSeconds(root.barDimSeconds))
     onPressed: function(mouseButton) {
-      if (mouseButton === Qt.RightButton) { root.enabled = !root.enabled; root.saveConfig() }
+      if (mouseButton === Qt.RightButton) {
+        if (!root.omarchyIdleStatusLoaded || root.omarchyIdleEnabled) return
+        root.enabled = !root.enabled
+        root.saveConfig()
+      }
       else root.toggle()
+    }
+  }
+
+  Process {
+    id: idlePluginToggleProcess
+    command: []
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var response = String(text || "").trim()
+        if (response !== "ok") root.omarchyIdleToggleError = response || strings.t("panel.idle_toggle_error")
+      }
+    }
+    onExited: function(exitCode) {
+      if (exitCode !== 0 && !root.omarchyIdleToggleError)
+        root.omarchyIdleToggleError = strings.t("panel.idle_toggle_error")
+      root.omarchyIdleTogglePending = false
     }
   }
 
@@ -290,10 +384,13 @@ BarWidget {
         foregroundMode: root.foregroundMode, displayDimSeconds: root.displayDimSeconds,
         barDimSeconds: root.barDimSeconds, monitorOffSeconds: root.monitorOffSeconds,
         lockSeconds: root.lockSeconds, screensaverSeconds: root.screensaverSeconds, themeForeground: String(root.themeForeground),
+        blinkClockEnabled: root.blinkClockEnabled,
         barActive: root.bar ? String(root.bar.urgent) : "",
-        nativeIdle: root.nativeIdle,
-        nativeIdleElapsedSeconds: root.nativeIdleElapsedSeconds,
-        nativeStatusLoaded: root.nativeStatusLoaded })
+        idleCycleActive: root.idleCycleActive,
+        idleElapsedSeconds: root.idleElapsedSeconds,
+        idleStatusLoaded: root.idleStatusLoaded,
+        omarchyIdleEnabled: root.omarchyIdleEnabled,
+        omarchyIdleStatusLoaded: root.omarchyIdleStatusLoaded })
     }
   }
 
@@ -303,6 +400,7 @@ BarWidget {
     bar: root.bar
     owner: root
     open: root.popupOpen
+    triggerMode: "hover"
     onOpenChanged: {
       if (root.popupOpen !== open) root.popupOpen = open
       if (!open && root.testDimActive) root.restore()
@@ -313,9 +411,9 @@ BarWidget {
     Column {
       id: contentColumn
       width: parent.width
-      spacing: Style.space(8)
+      spacing: Style.space(4)
 
-      Row {
+      RowLayout {
         width: parent.width
         spacing: Style.space(10)
         Text {
@@ -323,11 +421,11 @@ BarWidget {
           color: Commons.Color.accent
           font.family: root.bar ? root.bar.fontFamily : Style.font.family
           font.pixelSize: Style.font.title
-          anchors.verticalCenter: parent.verticalCenter
+          Layout.alignment: Qt.AlignVCenter
         }
         Column {
-          width: parent.width - enabledSwitch.width - Style.space(40)
-          anchors.verticalCenter: parent.verticalCenter
+          Layout.fillWidth: true
+          Layout.alignment: Qt.AlignVCenter
           spacing: Style.space(2)
           Text {
             textFormat: Text.PlainText
@@ -352,9 +450,51 @@ BarWidget {
         }
         ToggleSwitch {
           id: enabledSwitch
-          anchors.verticalCenter: parent.verticalCenter
+          Layout.alignment: Qt.AlignVCenter
           checked: root.enabled
+          interactive: true
+          foreground: Commons.Color.popups.text
+          accent: Commons.Color.accent
           onToggled: { root.enabled = !root.enabled; root.saveConfig() }
+        }
+      }
+
+      PanelSeparator { width: parent.width; foreground: Commons.Color.popups.text }
+
+      RowLayout {
+        width: parent.width
+        spacing: Style.space(8)
+        Column {
+          Layout.fillWidth: true
+          Layout.alignment: Qt.AlignVCenter
+          spacing: Style.space(1)
+          Text {
+            textFormat: Text.PlainText
+            text: strings.t("panel.omarchy_idle")
+            color: Commons.Color.popups.text
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.caption
+            font.bold: true
+          }
+          Text {
+            visible: root.omarchyIdleEnabled || !!root.omarchyIdleToggleError || !root.omarchyIdleStatusLoaded
+            textFormat: Text.PlainText
+            text: root.omarchyIdleToggleError ? root.omarchyIdleToggleError
+              : !root.omarchyIdleStatusLoaded ? strings.t("panel.idle_status_loading")
+              : strings.t("panel.idle_enabled_hint")
+            color: Commons.Color.popups.text
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
+          }
+        }
+        ToggleSwitch {
+          id: idlePluginSwitch
+          Layout.alignment: Qt.AlignVCenter
+          checked: root.omarchyIdleEnabled
+          interactive: root.omarchyIdleStatusLoaded && !root.omarchyIdleTogglePending
+          busy: root.omarchyIdleTogglePending
+          onToggled: root.setOmarchyIdlePluginEnabled(!root.omarchyIdleEnabled)
         }
       }
 
@@ -373,7 +513,7 @@ BarWidget {
 
       Column {
         width: parent.width
-        spacing: Style.space(7)
+        spacing: Style.space(3)
         Text {
           textFormat: Text.PlainText
           text: strings.t("panel.foreground")
@@ -384,14 +524,6 @@ BarWidget {
         }
         Row {
           spacing: Style.space(7)
-          Button {
-            text: strings.t("panel.gray")
-            selected: root.foregroundMode === "dark"
-            active: selected
-            bordered: true
-            foreground: Commons.Color.popups.text
-            onClicked: { root.foregroundMode = "dark"; root.settingsDirty = true }
-          }
           Button {
             text: strings.t("panel.dark_gray")
             selected: root.foregroundMode === "very-dark"
@@ -415,71 +547,103 @@ BarWidget {
         width: parent.width
         spacing: Style.space(8)
 
-        Text {
-          width: parent.width - playbackTimerSwitch.width - Style.space(8)
-          textFormat: Text.PlainText
-          text: strings.t("panel.bar_playback")
-          color: Commons.Color.popups.text
-          font.family: root.bar ? root.bar.fontFamily : Style.font.family
-          font.pixelSize: Style.font.caption
-          font.bold: true
-          wrapMode: Text.WordWrap
-          anchors.verticalCenter: parent.verticalCenter
+        Row {
+          width: (parent.width - Style.space(8)) / 2
+          spacing: Style.space(4)
+          Text {
+            width: parent.width - playbackTimerSwitch.width - Style.space(4)
+            textFormat: Text.PlainText
+            text: strings.t("panel.bar_playback")
+            color: Commons.Color.popups.text
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.caption
+            font.bold: true
+            wrapMode: Text.WordWrap
+            anchors.verticalCenter: parent.verticalCenter
+          }
+          ToggleSwitch {
+            id: playbackTimerSwitch
+            checked: root.barColorDuringPlayback
+            anchors.verticalCenter: parent.verticalCenter
+            onToggled: { root.barColorDuringPlayback = !root.barColorDuringPlayback; root.settingsDirty = true }
+          }
         }
 
-        ToggleSwitch {
-          id: playbackTimerSwitch
-          checked: root.barColorDuringPlayback
-          anchors.verticalCenter: parent.verticalCenter
-          onToggled: {
-            root.barColorDuringPlayback = !root.barColorDuringPlayback
-            root.settingsDirty = true
+        Row {
+          width: (parent.width - Style.space(8)) / 2
+          spacing: Style.space(4)
+          Text {
+            width: parent.width - blinkClockSwitch.width - Style.space(4)
+            textFormat: Text.PlainText
+            text: strings.t("panel.blink_clock")
+            color: Commons.Color.popups.text
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.caption
+            font.bold: true
+            wrapMode: Text.WordWrap
+            anchors.verticalCenter: parent.verticalCenter
+          }
+          ToggleSwitch {
+            id: blinkClockSwitch
+            checked: root.blinkClockEnabled
+            anchors.verticalCenter: parent.verticalCenter
+            onToggled: { root.blinkClockEnabled = !root.blinkClockEnabled; root.settingsDirty = true }
           }
         }
       }
 
-      TimerSetting {
-        bar: root.bar
-        label: strings.t("panel.display_timer")
-        displayValue: root.formatTimeout(root.displayDimSeconds)
-        value: root.displayDimSeconds
-        minimum: 5
-        maximum: 300
-        step: 5
-        onSettingChanged: function(nextValue) { root.selectDisplayTimeout(nextValue) }
+      Row {
+        width: parent.width
+        spacing: Style.space(8)
+        TimerSetting {
+          bar: root.bar
+          settingWidth: (parent.width - Style.space(8)) / 2
+          label: strings.t("panel.display_timer")
+          displayValue: root.formatTimeout(root.displayDimSeconds)
+          value: root.displayDimSeconds
+          minimum: 5
+          maximum: 300
+          step: 5
+          onSettingChanged: function(nextValue) { root.selectDisplayTimeout(nextValue) }
+        }
+        TimerSetting {
+          bar: root.bar
+          settingWidth: (parent.width - Style.space(8)) / 2
+          label: strings.t("panel.brightness")
+          displayValue: root.dimPercentage + "%"
+          value: root.dimPercentage
+          minimum: 1
+          maximum: 100
+          step: 1
+          onSettingChanged: function(nextValue) { root.selectLevel(nextValue) }
+        }
       }
 
-      TimerSetting {
-        bar: root.bar
-        label: strings.t("panel.brightness")
-        displayValue: root.dimPercentage + "%"
-        value: root.dimPercentage
-        minimum: 1
-        maximum: 100
-        step: 1
-        onSettingChanged: function(nextValue) { root.selectLevel(nextValue) }
-      }
-
-      TimerSetting {
-        bar: root.bar
-        label: strings.t("panel.screensaver_timer")
-        displayValue: root.formatTimeout(root.screensaverSeconds)
-        value: root.screensaverSeconds
-        minimum: 0
-        maximum: 900
-        step: 15
-        onSettingChanged: function(nextValue) { root.selectScreensaverTimeout(nextValue) }
-      }
-
-      TimerSetting {
-        bar: root.bar
-        label: strings.t("panel.monitor_off_timer")
-        displayValue: root.formatTimeout(root.monitorOffSeconds)
-        value: root.monitorOffSeconds
-        minimum: 0
-        maximum: 900
-        step: 15
-        onSettingChanged: function(nextValue) { root.selectMonitorOffTimeout(nextValue) }
+      Row {
+        width: parent.width
+        spacing: Style.space(8)
+        TimerSetting {
+          bar: root.bar
+          settingWidth: (parent.width - Style.space(8)) / 2
+          label: strings.t("panel.screensaver_timer")
+          displayValue: root.formatTimeout(root.screensaverSeconds)
+          value: root.screensaverSeconds
+          minimum: 0
+          maximum: 1800
+          step: 15
+          onSettingChanged: function(nextValue) { root.selectScreensaverTimeout(nextValue) }
+        }
+        TimerSetting {
+          bar: root.bar
+          settingWidth: (parent.width - Style.space(8)) / 2
+          label: strings.t("panel.monitor_off_timer")
+          displayValue: root.formatTimeout(root.monitorOffSeconds)
+          value: root.monitorOffSeconds
+          minimum: 0
+          maximum: 3600
+          step: 15
+          onSettingChanged: function(nextValue) { root.selectMonitorOffTimeout(nextValue) }
+        }
       }
 
       TimerSetting {
@@ -488,12 +652,10 @@ BarWidget {
         displayValue: root.formatTimeout(root.lockSeconds)
         value: root.lockSeconds
         minimum: 0
-        maximum: 3600
+        maximum: 10800
         step: 30
         onSettingChanged: function(nextValue) { root.selectLockTimeout(nextValue) }
       }
-
-
 
       Text {
         width: parent.width
@@ -508,34 +670,67 @@ BarWidget {
         wrapMode: Text.WordWrap
       }
 
-      Row {
+      RowLayout {
         width: parent.width
         spacing: Style.space(8)
         Button {
-          text: strings.t("panel.save")
+          iconText: "󰆓"
+          tooltipText: strings.t("panel.save")
+          Layout.minimumWidth: Style.space(34)
+          Layout.preferredWidth: Style.space(34)
+          Layout.maximumWidth: Style.space(34)
           bordered: true
           foreground: Commons.Color.popups.text
           onClicked: root.saveSettings()
         }
         Button {
-          text: strings.t("panel.restart_shell")
+          iconText: "󰑐"
+          tooltipText: strings.t("panel.restart_shell")
+          Layout.minimumWidth: Style.space(34)
+          Layout.preferredWidth: Style.space(34)
+          Layout.maximumWidth: Style.space(34)
           bordered: true
           foreground: Commons.Color.popups.text
           onClicked: root.restartShell()
         }
         Button {
-          text: strings.t("panel.test")
+          iconText: "󰐊"
+          tooltipText: strings.t("panel.test")
+          Layout.minimumWidth: Style.space(34)
+          Layout.preferredWidth: Style.space(34)
+          Layout.maximumWidth: Style.space(34)
           bordered: true
           foreground: Commons.Color.popups.text
           onClicked: root.testDim()
         }
         Button {
-          text: strings.t("panel.restore")
+          iconText: "󰓛"
+          tooltipText: strings.t("panel.restore")
+          Layout.minimumWidth: Style.space(34)
+          Layout.preferredWidth: Style.space(34)
+          Layout.maximumWidth: Style.space(34)
           bordered: true
           foreground: Commons.Color.popups.text
           onClicked: root.restore()
         }
+        Item { Layout.fillWidth: true }
+        Button {
+          iconText: "×"
+          tooltipText: strings.t("panel.close")
+          Layout.minimumWidth: Style.space(34)
+          Layout.preferredWidth: Style.space(34)
+          Layout.maximumWidth: Style.space(34)
+          bordered: true
+          foreground: Commons.Color.popups.text
+          onClicked: root.close()
+        }
       }
     }
+  }
+
+  Component.onDestruction: {
+    if (root.testDimActive)
+      Quickshell.execDetached(["omarchy-shell", "dim-it.service", "triggerActive"])
+    Quickshell.execDetached(["python3", root.foregroundScript, "restore"])
   }
 }
